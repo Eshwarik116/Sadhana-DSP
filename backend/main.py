@@ -218,7 +218,7 @@ async def live_pitch(websocket: WebSocket):
     await websocket.accept()
     try:
         config = await websocket.receive_json()
-        input_sr = int(config.get("sample_rate", 48000))
+        input_sr = int(config.get("sample_rate", 10000))
         sa_hz = float(config.get("sa_hz", 240.0))
         target_semitones = int(config.get("target_semitones", 0))
         tolerance = float(config.get("tolerance_cents", 25.0))

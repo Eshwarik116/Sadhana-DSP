@@ -11,6 +11,11 @@ import {
   Area,
   AreaChart,
 } from "recharts";
+import {
+  classifyPitch,
+  getStableSaSuggestion,
+  noteNameFromFrequency,
+} from "./pitchFeedback.js";
 
 const BACKEND_HOST = import.meta.env.VITE_BACKEND_HOST || "127.0.0.1:8000";
 
@@ -37,13 +42,20 @@ export default function App() {
   const [target, setTarget] = useState(0);
   const [tolerance, setTolerance] = useState(25);
   const [running, setRunning] = useState(false);
+  const [findingSa, setFindingSa] = useState(false);
+  const [saFinderSamples, setSaFinderSamples] = useState(0);
+  const [suggestedSaHz, setSuggestedSaHz] = useState(null);
   const [result, setResult] = useState(null);
+  const [pitchFeedback, setPitchFeedback] = useState(null);
+  const [calculatedCents, setCalculatedCents] = useState(null);
   const [history, setHistory] = useState([]);
   const [error, setError] = useState("");
   const [connState, setConnState] = useState("idle");
   const socketRef = useRef(null);
   const streamRef = useRef(null);
   const audioContextRef = useRef(null);
+  const toneContextRef = useRef(null);
+  const toneOscillatorRef = useRef(null);
   const processorRef = useRef(null);
   const sequenceRef = useRef(0);
   const configRef = useRef({
@@ -55,8 +67,20 @@ export default function App() {
   const reconnectTimerRef = useRef(null);
   const reconnectAttemptRef = useRef(0);
   const closingRef = useRef(false);
+  const pitchCandidateRef = useRef({ state: null, count: 0, stable: "waiting" });
+  const findingSaRef = useRef(false);
+  const saReadingsRef = useRef([]);
 
-  useEffect(() => () => stopMic(), []);
+  useEffect(
+    () => () => {
+      stopMic();
+      toneOscillatorRef.current?.stop();
+      toneContextRef.current?.close().catch((e) => {
+        console.error("Could not close the Sa preview audio context.", e);
+      });
+    },
+    [],
+  );
 
   useEffect(() => {
     configRef.current = {
@@ -71,6 +95,10 @@ export default function App() {
 
   async function startMic() {
     setError("");
+    setResult(null);
+    setPitchFeedback("waiting");
+    setCalculatedCents(null);
+    pitchCandidateRef.current = { state: null, count: 0, stable: "waiting" };
     closingRef.current = false;
     reconnectAttemptRef.current = 0;
     setConnState("connecting");
@@ -113,6 +141,57 @@ export default function App() {
     }
   }
 
+  function startSaFinder() {
+    findingSaRef.current = true;
+    saReadingsRef.current = [];
+    setFindingSa(true);
+    setSaFinderSamples(0);
+    setSuggestedSaHz(null);
+    startMic();
+  }
+
+  function useSuggestedSa() {
+    if (suggestedSaHz === null) return;
+    setSaHz(suggestedSaHz.toFixed(1));
+    stopMic();
+  }
+
+  async function playSuggestedSa() {
+    if (suggestedSaHz === null) return;
+    if (findingSaRef.current) stopMic();
+    try {
+      if (!toneContextRef.current) {
+        toneContextRef.current = new AudioContext();
+      }
+      const context = toneContextRef.current;
+      if (context.state === "suspended") await context.resume();
+      toneOscillatorRef.current?.stop();
+
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.value = suggestedSaHz;
+      gain.gain.setValueAtTime(0.0001, context.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.08, context.currentTime + 0.04);
+      gain.gain.setValueAtTime(0.08, context.currentTime + 1.15);
+      gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 1.3);
+      oscillator.connect(gain);
+      gain.connect(context.destination);
+      oscillator.onended = () => {
+        if (toneOscillatorRef.current === oscillator) {
+          toneOscillatorRef.current = null;
+        }
+        oscillator.disconnect();
+        gain.disconnect();
+      };
+      toneOscillatorRef.current = oscillator;
+      oscillator.start();
+      oscillator.stop(context.currentTime + 1.3);
+    } catch (e) {
+      setError(e?.message || "Could not play the Sa reference tone.");
+    }
+  }
+
   function openSocket() {
     const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
     const socket = new WebSocket(`${wsProtocol}://${BACKEND_HOST}/ws/live`);
@@ -126,14 +205,86 @@ export default function App() {
     };
 
     socket.onmessage = (event) => {
+      if (closingRef.current) return;
       const data = JSON.parse(event.data);
       if (data.error) {
         setError(data.error);
+        setPitchFeedback("waiting");
+        setCalculatedCents(null);
+        saReadingsRef.current = [];
+        setSaFinderSamples(0);
+        setSuggestedSaHz(null);
+        pitchCandidateRef.current = {
+          state: null,
+          count: 0,
+          stable: "waiting",
+        };
         return;
       }
       setResult(data);
-      if (data.voiced && Number.isFinite(data.error_cents)) {
-        const point = { t: sequenceRef.current++, cents: data.error_cents };
+      if (findingSaRef.current) {
+        if (
+          data.voiced &&
+          Number.isFinite(data.f0) &&
+          data.f0 >= 60 &&
+          data.f0 <= 600 &&
+          Number.isFinite(data.confidence) &&
+          data.confidence >= 0.1
+        ) {
+          saReadingsRef.current = [...saReadingsRef.current, data.f0].slice(-31);
+        } else {
+          saReadingsRef.current = [];
+        }
+        setSaFinderSamples(saReadingsRef.current.length);
+        setSuggestedSaHz(getStableSaSuggestion(saReadingsRef.current));
+        return;
+      }
+      const targetFrequency = Number(
+        data.target_hz ??
+          Number(configRef.current.sa_hz) *
+            2 ** (configRef.current.target_semitones / 12),
+      );
+      const assessment = data.voiced
+        ? classifyPitch(
+            data.f0,
+            targetFrequency,
+            Number(configRef.current.tolerance_cents),
+            Number.isFinite(data.confidence) ? data.confidence : 0,
+          )
+        : { centsDeviation: null, state: "waiting" };
+
+      if (assessment.state === "waiting") {
+        setPitchFeedback("waiting");
+        setCalculatedCents(null);
+        pitchCandidateRef.current = {
+          state: null,
+          count: 0,
+          stable: "waiting",
+        };
+      } else {
+        setCalculatedCents(assessment.centsDeviation);
+        const candidate = pitchCandidateRef.current;
+        if (assessment.state === candidate.stable) {
+          candidate.state = null;
+          candidate.count = 0;
+        } else {
+          if (candidate.state === assessment.state) {
+            candidate.count += 1;
+          } else {
+            candidate.state = assessment.state;
+            candidate.count = 1;
+          }
+          if (candidate.count >= 2) {
+            candidate.stable = assessment.state;
+            candidate.state = null;
+            candidate.count = 0;
+            setPitchFeedback(assessment.state);
+          }
+        }
+        const point = {
+          t: sequenceRef.current++,
+          cents: assessment.centsDeviation,
+        };
         setHistory((old) => [...old.slice(-79), point]);
       }
     };
@@ -147,6 +298,14 @@ export default function App() {
   }
 
   function scheduleReconnect() {
+    setPitchFeedback("waiting");
+    setCalculatedCents(null);
+    if (findingSaRef.current) {
+      saReadingsRef.current = [];
+      setSaFinderSamples(0);
+      setSuggestedSaHz(null);
+    }
+    pitchCandidateRef.current = { state: null, count: 0, stable: "waiting" };
     const attempt = reconnectAttemptRef.current++;
     if (attempt >= MAX_RECONNECT_ATTEMPTS) {
       setConnState("failed");
@@ -167,6 +326,9 @@ export default function App() {
 
   function retryConnection() {
     setError("");
+    setPitchFeedback("waiting");
+    setCalculatedCents(null);
+    pitchCandidateRef.current = { state: null, count: 0, stable: "waiting" };
     reconnectAttemptRef.current = 0;
     setConnState("connecting");
     openSocket();
@@ -174,6 +336,8 @@ export default function App() {
 
   function stopMic() {
     closingRef.current = true;
+    findingSaRef.current = false;
+    saReadingsRef.current = [];
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
@@ -195,10 +359,18 @@ export default function App() {
     } catch {}
     audioContextRef.current = null;
     setRunning(false);
+    setFindingSa(false);
+    setSaFinderSamples(0);
+    setPitchFeedback(null);
+    setCalculatedCents(null);
+    pitchCandidateRef.current = { state: null, count: 0, stable: "waiting" };
     setConnState("idle");
   }
 
-  const status = result?.status || "waiting";
+  const status =
+    running && pitchFeedback && pitchFeedback !== "waiting"
+      ? { correct: "in_tune", low: "flat", high: "sharp" }[pitchFeedback]
+      : "waiting";
   const targetHz = Number(
     result?.target_hz ?? Number(saHz) * 2 ** (swaras[target].semitones / 12),
   );
@@ -223,18 +395,43 @@ export default function App() {
       reconnecting: "Reconnecting",
       failed: "Disconnected",
     }[connState] || "Stopped";
-  const coachIcon =
-    { in_tune: "✓", flat: "↓", sharp: "↑", uncertain: "♪" }[status] || "♪";
   const f0Text = result?.f0 != null ? Number(result.f0).toFixed(1) : null;
   const [f0Whole, f0Frac] = f0Text ? f0Text.split(".") : [null, null];
   const deviationClass =
-    result?.error_cents == null
+    calculatedCents == null
       ? ""
-      : result.error_cents < -tolerance
+      : calculatedCents < -tolerance
         ? "flat-text"
-        : result.error_cents > tolerance
+        : calculatedCents > tolerance
           ? "sharp-text"
           : "";
+  const feedbackContent = {
+    correct: {
+      icon: "✓",
+      label: "IN TUNE",
+      message: "Perfect pitch — you're on the right note!",
+    },
+    low: {
+      icon: "↓",
+      label: "TOO LOW · FLAT",
+      message: "Raise your voice slightly.",
+    },
+    high: {
+      icon: "↑",
+      label: "TOO HIGH · SHARP",
+      message: "Lower your voice slightly.",
+    },
+    waiting: {
+      icon: "♪",
+      label: "LISTENING",
+      message: "Waiting for a stable pitch…",
+    },
+  };
+  const visibleFeedback = running
+    ? feedbackContent[pitchFeedback || "waiting"]
+    : null;
+  const isSuggestedSaSelected =
+    suggestedSaHz !== null && Number(saHz) === suggestedSaHz;
 
   return (
     <main className="page">
@@ -294,12 +491,12 @@ export default function App() {
               type="number"
               min="60"
               max="600"
-              step="1"
+              step="0.1"
               value={saHz}
               disabled={running}
               onChange={(e) => setSaHz(e.target.value)}
             />
-            <small>Choose the Sa comfortable for your voice.</small>
+            <small>Your personal starting note for practice.</small>
           </label>
           <label>
             Target swara
@@ -328,6 +525,67 @@ export default function App() {
             <small>Intonation varies by raga and style.</small>
           </label>
         </div>
+        <div className="sa-finder">
+          <div className="sa-finder-copy">
+            <strong>Not sure what Sa to choose?</strong>
+            <span>
+              Hum a comfortable, steady note. We’ll listen and suggest a
+              starting pitch—no male/female range selection needed.
+            </span>
+          </div>
+          <button
+            className={findingSa ? "stop-btn" : "sa-find-btn"}
+            onClick={findingSa ? stopMic : startSaFinder}
+            disabled={running && !findingSa}>
+            {findingSa
+              ? "■ Stop listening"
+              : running
+                ? "Stop session to find Sa"
+                : "♪ Find my comfortable Sa"}
+          </button>
+        </div>
+        {(findingSa || suggestedSaHz !== null) && (
+          <div
+            className={`sa-finder-result ${suggestedSaHz !== null ? "ready" : ""}`}
+            role="status"
+            aria-live="polite">
+            {suggestedSaHz === null ? (
+              <>
+                <strong>Listening for your note…</strong>
+                <span>
+                  Keep humming comfortably and steadily. Stable readings:{" "}
+                  {saFinderSamples}/24
+                </span>
+              </>
+            ) : (
+              <>
+                <div className="sa-suggestion-copy">
+                  <strong>
+                    Suggested Sa: {suggestedSaHz.toFixed(1)} Hz
+                    {noteNameFromFrequency(suggestedSaHz)
+                      ? ` · near ${noteNameFromFrequency(suggestedSaHz)}`
+                      : ""}
+                  </strong>
+                  <span>
+                    Try the reference tone and keep this pitch only if it feels
+                    comfortable for you.
+                  </span>
+                </div>
+                <div className="sa-suggestion-actions">
+                  <button className="sa-preview-btn" onClick={playSuggestedSa}>
+                    ▶ Hear reference
+                  </button>
+                  <button
+                    className="primary-btn"
+                    onClick={useSuggestedSa}
+                    disabled={isSuggestedSaSelected}>
+                    {isSuggestedSaSelected ? "✓ Using this Sa" : "Use this Sa"}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
         <div className="action-row">
           {!running ? (
             <button className="primary-btn" onClick={startMic}>
@@ -335,7 +593,7 @@ export default function App() {
             </button>
           ) : (
             <button className="stop-btn" onClick={stopMic}>
-              ■ Stop session
+              ■ {findingSa ? "Stop Sa finder" : "Stop session"}
             </button>
           )}
           <span className="privacy-note">
@@ -386,18 +644,39 @@ export default function App() {
                   ? ` · octave-normalized ${result.comparison_f0} Hz`
                   : ""}
               </p>
-
+              <div className="target-note">
+                <span>Practicing</span>
+                <strong>{swaras[target].label}</strong>
+                <span>{targetHz.toFixed(2)} Hz</span>
+              </div>
+              {visibleFeedback && (
+                <div
+                  className={`pitch-feedback pitch-feedback-${pitchFeedback || "waiting"}`}
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true">
+                  <span className="pitch-feedback-icon" aria-hidden="true">
+                    {visibleFeedback.icon}
+                  </span>
+                  <span className="pitch-feedback-copy">
+                    <strong className="pitch-feedback-label">
+                      {visibleFeedback.label}
+                    </strong>
+                    <span>{visibleFeedback.message}</span>
+                  </span>
+                </div>
+              )}
               <ul className="hud">
                 <li>
-                  <span>Target</span>
+                  <span>Target frequency</span>
                   <strong>{targetHz.toFixed(2)} Hz</strong>
                 </li>
                 <li>
                   <span>Deviation</span>
                   <strong className={deviationClass}>
-                    {result?.error_cents == null
+                    {calculatedCents == null
                       ? "—"
-                      : `${result.error_cents > 0 ? "+" : ""}${result.error_cents} ¢`}
+                      : `${calculatedCents > 0 ? "+" : ""}${calculatedCents.toFixed(1)} ¢`}
                   </strong>
                 </li>
                 <li>
@@ -410,14 +689,6 @@ export default function App() {
                 </li>
               </ul>
 
-              <p className={`coach coach-${status}`}>
-                <span className="coach-icon">{coachIcon}</span>
-                <span>
-                  <b>Coach</b>{" "}
-                  {result?.message ||
-                    "Start the microphone, then sing a steady note to see feedback."}
-                </span>
-              </p>
             </div>
 
             <div className="scene-plot">
@@ -492,8 +763,10 @@ export default function App() {
                   />
                   <ReferenceLine
                     x={targetHz}
-                    stroke="#5ce0a3"
-                    strokeDasharray="5 4"
+                    stroke="#f2c94c"
+                    strokeWidth={3}
+                    strokeDasharray="7 4"
+                    strokeOpacity={0.95}
                   />
                   <ReferenceLine
                     x={targetHz * 2}
